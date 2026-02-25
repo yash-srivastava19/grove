@@ -27,6 +27,8 @@ type Note struct {
 //	---
 func ParseFrontmatter(content string) (meta map[string]string, body string) {
 	meta = make(map[string]string)
+	// Normalize CRLF to LF
+	content = strings.ReplaceAll(content, "\r\n", "\n")
 	body = content
 
 	if !strings.HasPrefix(content, "---") {

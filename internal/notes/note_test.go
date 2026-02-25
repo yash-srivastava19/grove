@@ -99,6 +99,18 @@ func TestNoteFromRaw_noFrontmatter(t *testing.T) {
 	}
 }
 
+func TestParseFrontmatter_CRLF(t *testing.T) {
+	// Files created on Windows or synced via some tools may have CRLF
+	content := "---\r\ntitle: CRLF Note\r\ntags: [test]\r\n---\r\n\r\nBody here."
+	meta, body := ParseFrontmatter(content)
+	if meta["title"] != "CRLF Note" {
+		t.Errorf("title with CRLF: got %q", meta["title"])
+	}
+	if body != "Body here." {
+		t.Errorf("body with CRLF: got %q", body)
+	}
+}
+
 func TestBuildFrontmatter(t *testing.T) {
 	n := &Note{
 		Title:   "Test",
