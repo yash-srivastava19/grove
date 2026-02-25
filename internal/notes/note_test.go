@@ -111,6 +111,101 @@ func TestParseFrontmatter_CRLF(t *testing.T) {
 	}
 }
 
+func TestExtractLinks(t *testing.T) {
+	tests := []struct {
+		name     string
+		body     string
+		expected []string
+	}{
+		{
+			name:     "single link",
+			body:     "See [[My Note]] for details.",
+			expected: []string{"My Note"},
+		},
+		{
+			name:     "multiple links",
+			body:     "[[Alpha]] and [[Beta]] are connected.",
+			expected: []string{"Alpha", "Beta"},
+		},
+		{
+			name:     "duplicate links deduped",
+			body:     "[[Alpha]] appears twice [[Alpha]].",
+			expected: []string{"Alpha"},
+		},
+		{
+			name:     "no links",
+			body:     "Plain text with no wiki links.",
+			expected: nil,
+		},
+		{
+			name:     "link in heading",
+			body:     "## See also [[Reference]]",
+			expected: []string{"Reference"},
+		},
+		{
+			name:     "multiline",
+			body:     "Note A links to [[Note B]].\n\nAnd also to [[Note C]].",
+			expected: []string{"Note B", "Note C"},
+		},
+		{
+			name:     "empty brackets ignored",
+			body:     "This [[]] is empty.",
+			expected: nil,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := ExtractLinks(tt.body)
+			if len(got) != len(tt.expected) {
+				t.Errorf("ExtractLinks(%q): got %v, want %v", tt.body, got, tt.expected)
+				return
+			}
+			for i := range got {
+				if got[i] != tt.expected[i] {
+					t.Errorf("ExtractLinks(%q)[%d]: got %q, want %q", tt.body, i, got[i], tt.expected[i])
+				}
+			}
+		})
+	}
+}
+
+func TestBacklinks(t *testing.T) {
+	noteA := &Note{ID: "a", Title: "Alpha", Body: "Some text linking to [[Beta]]."}
+	noteB := &Note{ID: "b", Title: "Beta", Body: "Beta doesn't link back."}
+	noteC := &Note{ID: "c", Title: "Gamma", Body: "Gamma links to [[Beta]] and [[Alpha]]."}
+	all := []*Note{noteA, noteB, noteC}
+
+	t.Run("backlinks to Beta", func(t *testing.T) {
+		back := Backlinks("Beta", all)
+		if len(back) != 2 {
+			t.Errorf("expected 2 backlinks to Beta, got %d", len(back))
+			return
+		}
+		titles := map[string]bool{}
+		for _, n := range back {
+			titles[n.Title] = true
+		}
+		if !titles["Alpha"] || !titles["Gamma"] {
+			t.Errorf("expected Alpha and Gamma as backlinks, got %v", titles)
+		}
+	})
+
+	t.Run("backlinks to Alpha", func(t *testing.T) {
+		back := Backlinks("Alpha", all)
+		if len(back) != 1 || back[0].Title != "Gamma" {
+			t.Errorf("expected [Gamma] as backlinks to Alpha, got %v", back)
+		}
+	})
+
+	t.Run("no backlinks", func(t *testing.T) {
+		back := Backlinks("Gamma", all)
+		if len(back) != 0 {
+			t.Errorf("expected no backlinks to Gamma, got %v", back)
+		}
+	})
+}
+
 func TestBuildFrontmatter(t *testing.T) {
 	n := &Note{
 		Title:   "Test",

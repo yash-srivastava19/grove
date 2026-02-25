@@ -1,9 +1,42 @@
 package notes
 
 import (
+	"regexp"
 	"strings"
 	"time"
 )
+
+// wikiLinkRe matches [[link target]] syntax.
+var wikiLinkRe = regexp.MustCompile(`\[\[([^\]]+)\]\]`)
+
+// ExtractLinks returns all wiki-link targets found in body.
+// Duplicate targets are included once each (deduped).
+func ExtractLinks(body string) []string {
+	matches := wikiLinkRe.FindAllStringSubmatch(body, -1)
+	seen := map[string]bool{}
+	var out []string
+	for _, m := range matches {
+		target := strings.TrimSpace(m[1])
+		if target != "" && !seen[target] {
+			seen[target] = true
+			out = append(out, target)
+		}
+	}
+	return out
+}
+
+// Backlinks returns all notes in all that contain a [[targetTitle]] wiki-link.
+func Backlinks(targetTitle string, all []*Note) []*Note {
+	target := "[[" + targetTitle + "]]"
+	targetLower := strings.ToLower(target)
+	var result []*Note
+	for _, n := range all {
+		if strings.Contains(strings.ToLower(n.Body), targetLower) {
+			result = append(result, n)
+		}
+	}
+	return result
+}
 
 type Note struct {
 	ID       string    // filename without extension
