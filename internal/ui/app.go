@@ -76,9 +76,9 @@ type App struct {
 	searchQuery string
 
 	// AI
-	aiResponse string
-	aiLoading  bool
-	aiError    string
+	aiHistory []aiEntry // Q+A pairs
+	aiLoading bool
+	aiError   string
 
 	// Delete
 	deleteTarget *notes.Note
@@ -86,9 +86,17 @@ type App struct {
 	// Vim g-prefix tracking
 	lastKey string
 
+	// Help: remember which state to return to
+	prevState appState
+
 	// Status
 	statusMsg     string
 	statusIsError bool
+}
+
+type aiEntry struct {
+	question string
+	answer   string
 }
 
 func New(cfg *config.Config, store *notes.Store, aiClient *ai.Client) *App {
@@ -199,8 +207,8 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		a.aiLoading = false
 		if msg.err != nil {
 			a.aiError = msg.err.Error()
-		} else {
-			a.aiResponse = msg.response
+		} else if len(a.aiHistory) > 0 {
+			a.aiHistory[len(a.aiHistory)-1].answer = msg.response
 		}
 
 	case tea.KeyMsg:
@@ -302,6 +310,7 @@ func (a *App) updateList(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return a, a.cmdLoadNotes()
 
 	case "?":
+		a.prevState = stateList
 		a.state = stateHelp
 	}
 
@@ -331,7 +340,6 @@ func (a *App) updateViewer(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		a.state = stateAIPanel
 		a.aiInput.SetValue("")
 		a.aiInput.Focus()
-		a.aiResponse = ""
 		a.aiError = ""
 		a.aiLoading = false
 		return a, textinput.Blink
@@ -364,6 +372,7 @@ func (a *App) updateViewer(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		a.viewport.ScrollUp(a.viewport.Height)
 
 	case "?":
+		a.prevState = stateViewer
 		a.state = stateHelp
 	}
 
@@ -475,8 +484,9 @@ func (a *App) updateAIPanel(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return a, nil
 		}
 		a.aiLoading = true
-		a.aiResponse = ""
 		a.aiError = ""
+		a.aiHistory = append(a.aiHistory, aiEntry{question: q})
+		a.aiInput.SetValue("")
 		return a, a.cmdAskAI(a.current, q)
 	}
 
@@ -517,7 +527,7 @@ func (a *App) updateConfirmDelete(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 func (a *App) updateHelp(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
 	case "q", "esc", "?":
-		a.state = stateList
+		a.state = a.prevState
 	}
 	return a, nil
 }
@@ -632,7 +642,15 @@ func (a *App) viewViewer() string {
 		b.WriteString(sty.Render("  " + a.statusMsg))
 	} else {
 		pct := int(a.viewport.ScrollPercent() * 100)
-		b.WriteString(styleHint.Render(fmt.Sprintf("  j/k scroll  gg/G top/bot  d/u half-page  e edit  A ask AI  q back  %d%%", pct)))
+		// Show note position in list
+		pos := ""
+		for i, n := range a.filtered {
+			if a.current != nil && n.ID == a.current.ID {
+				pos = fmt.Sprintf(" (%d/%d)", i+1, len(a.filtered))
+				break
+			}
+		}
+		b.WriteString(styleHint.Render(fmt.Sprintf("  j/k  gg/G  d/u  e edit  A AI  q back%s  %d%%", pos, pct)))
 	}
 	return b.String()
 }
@@ -706,35 +724,46 @@ func (a *App) viewAIPanel() string {
 	b.WriteString("  " + title + "  " + aiLabel + "\n")
 	b.WriteString(styleDivider.Render(strings.Repeat("─", w)) + "\n")
 
-	// Response area
 	innerH := a.height - 10
 	if innerH < 3 {
 		innerH = 3
 	}
 
-	var content string
-	switch {
-	case a.aiLoading:
-		content = styleSubtitle.Render("  ⟳  thinking...")
-	case a.aiError != "":
-		content = styleError.Render("  ✗  " + a.aiError)
-	case a.aiResponse != "":
-		r, err := glamour.NewTermRenderer(glamour.WithAutoStyle(), glamour.WithWordWrap(w-10))
-		var rendered string
-		if err == nil {
-			rendered, err = r.Render(a.aiResponse)
+	// Build conversation display
+	var lines []string
+	r, _ := glamour.NewTermRenderer(glamour.WithAutoStyle(), glamour.WithWordWrap(w-10))
+
+	if len(a.aiHistory) == 0 && !a.aiLoading {
+		lines = []string{styleSubtitle.Render("  Ask anything about this note...")}
+	} else {
+		for _, entry := range a.aiHistory {
+			lines = append(lines, styleAILabel.Render("  Q: ")+styleNormalItem.Render(entry.question))
+			if entry.answer != "" {
+				rendered := entry.answer
+				if r != nil {
+					if out, err := r.Render(entry.answer); err == nil {
+						rendered = strings.TrimRight(out, "\n")
+					}
+				}
+				for _, l := range strings.Split(rendered, "\n") {
+					lines = append(lines, l)
+				}
+			}
+			lines = append(lines, "")
 		}
-		if err != nil {
-			rendered = a.aiResponse
+		if a.aiLoading {
+			lines = append(lines, styleSubtitle.Render("  ⟳  thinking..."))
 		}
-		lines := strings.Split(strings.TrimRight(rendered, "\n"), "\n")
-		if len(lines) > innerH {
-			lines = lines[:innerH]
+		if a.aiError != "" {
+			lines = append(lines, styleError.Render("  ✗  "+a.aiError))
 		}
-		content = strings.Join(lines, "\n")
-	default:
-		content = styleSubtitle.Render("  Ask anything about this note...")
 	}
+
+	// Trim to visible height (show last N lines)
+	if len(lines) > innerH {
+		lines = lines[len(lines)-innerH:]
+	}
+	content := strings.Join(lines, "\n")
 
 	panel := stylePanelBorder.Width(w - 6).Height(innerH).Render(content)
 	b.WriteString(panel + "\n\n")
@@ -747,9 +776,9 @@ func (a *App) viewAIPanel() string {
 	b.WriteString(styleDivider.Render(strings.Repeat("─", w)) + "\n")
 
 	if a.aiLoading {
-		b.WriteString(styleHint.Render("  waiting...  Esc cancel"))
+		b.WriteString(styleHint.Render("  waiting for Gemini..."))
 	} else {
-		b.WriteString(styleHint.Render("  Enter submit  Esc back"))
+		b.WriteString(styleHint.Render("  Enter submit  Esc back to note"))
 	}
 	return b.String()
 }
@@ -817,6 +846,7 @@ func (a *App) openNote(note *notes.Note) {
 		return
 	}
 	a.current = loaded
+	a.aiHistory = nil // reset AI history per note
 	a.state = stateViewer
 	a.reRender()
 }
