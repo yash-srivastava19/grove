@@ -1,0 +1,19 @@
+linters:
+  enable:
+    - govet
+    - staticcheck
+    - errcheck
+    - unused
+    - gofmt
+
+linters-settings:
+  errcheck:
+    exclude-functions:
+      - (strings.Builder).WriteString
+      - (strings.Builder).WriteByte
+
+issues:
+  exclude-rules:
+    - path: _test\.go
+      linters:
+        - errcheck
