@@ -138,9 +138,19 @@ func (a *App) cmdLoadNotes() tea.Cmd {
 	}
 }
 
+func editorCmd(editor, path string) *exec.Cmd {
+	// Support editor config with args, e.g. "code --wait"
+	parts := strings.Fields(editor)
+	if len(parts) == 0 {
+		parts = []string{"vi"}
+	}
+	args := append(parts[1:], path)
+	return exec.Command(parts[0], args...)
+}
+
 func (a *App) cmdOpenEditor(note *notes.Note) tea.Cmd {
 	noteID := note.ID
-	return tea.ExecProcess(exec.Command(a.cfg.Editor, note.Filename), func(err error) tea.Msg {
+	return tea.ExecProcess(editorCmd(a.cfg.Editor, note.Filename), func(err error) tea.Msg {
 		ns, loadErr := a.store.LoadAll()
 		if loadErr != nil {
 			return editorClosedMsg{err: loadErr}

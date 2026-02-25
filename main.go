@@ -23,6 +23,7 @@ Usage:
   grove new <title>        create note, open in $EDITOR
   grove today              open today's daily note in $EDITOR
   grove add <text>         append quick thought to today's note
+  grove search <query>     search notes (non-interactive)
   grove list               list all notes
   grove version
 
@@ -104,6 +105,29 @@ func main() {
 			fmt.Printf("%-40s  %s\n", n.ID, n.Title)
 		}
 
+	case "search", "s":
+		query := strings.Join(args[1:], " ")
+		if query == "" {
+			die("usage: grove search <query>")
+		}
+		all, err := store.LoadAll()
+		if err != nil {
+			die("search: %v", err)
+		}
+		found := 0
+		ql := strings.ToLower(query)
+		for _, n := range all {
+			haystack := strings.ToLower(n.Title + " " + strings.Join(n.Tags, " ") + " " + n.Body)
+			if strings.Contains(haystack, ql) {
+				fmt.Printf("%-40s  %s\n", n.ID, n.Title)
+				found++
+			}
+		}
+		if found == 0 {
+			fmt.Fprintf(os.Stderr, "no notes match %q\n", query)
+			os.Exit(1)
+		}
+
 	default:
 		fmt.Fprintf(os.Stderr, "grove: unknown command %q\n\n", args[0])
 		fmt.Print(usage)
@@ -167,7 +191,13 @@ Happy gardening.
 }
 
 func launchEditor(editor, path string) {
-	cmd := exec.Command(editor, path)
+	// Support editor config with args, e.g. "code --wait"
+	parts := strings.Fields(editor)
+	if len(parts) == 0 {
+		parts = []string{"vi"}
+	}
+	args := append(parts[1:], path)
+	cmd := exec.Command(parts[0], args...)
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
