@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"sort"
 	"strings"
 	"time"
 
@@ -11,6 +12,7 @@ import (
 	"github.com/yash-srivastava19/grove/internal/ai"
 	"github.com/yash-srivastava19/grove/internal/config"
 	"github.com/yash-srivastava19/grove/internal/notes"
+	"github.com/yash-srivastava19/grove/internal/templates"
 	"github.com/yash-srivastava19/grove/internal/ui"
 )
 
@@ -19,18 +21,22 @@ const version = "0.1.0"
 const usage = `grove — your knowledge garden in the terminal
 
 Usage:
-  grove                    open TUI
-  grove new <title>        create note, open in $EDITOR
-  grove today              open today's daily note in $EDITOR
-  grove add <text>         append quick thought to today's note
-  grove search <query>     search notes (non-interactive)
-  grove list               list all notes
+  grove                              open TUI
+  grove new [--template T] <title>   create note, open in $EDITOR
+  grove today                        open today's daily note in $EDITOR
+  grove add <text>                   append quick thought to today's note
+  grove search <query>               search notes (non-interactive)
+  grove list                         list all notes
+  grove ask <question>               ask AI about your entire vault
+  grove stats                        show vault statistics
   grove version
 
+Templates: default, meeting, brainstorm, research
+
 TUI keys:
-  j/k  navigate    Enter open    n new    t today
-  /    search      d delete      e edit   A ask AI
-  ?    help        q quit
+  j/k  navigate    Enter open    n new    N new with template    t today
+  /    search      d delete      e edit   A ask AI               @ vault AI
+  L    links       ?    help     q quit
 `
 
 func main() {
@@ -59,13 +65,36 @@ func main() {
 		fmt.Print(usage)
 
 	case "new", "n":
-		title := strings.Join(args[1:], " ")
+		// Parse optional --template flag
+		tmplName := "default"
+		rest := args[1:]
+		for i := 0; i < len(rest); i++ {
+			if rest[i] == "--template" || rest[i] == "-t" {
+				if i+1 >= len(rest) {
+					die("--template requires a name (default, meeting, brainstorm, research)")
+				}
+				tmplName = rest[i+1]
+				rest = append(rest[:i], rest[i+2:]...)
+				break
+			}
+			if strings.HasPrefix(rest[i], "--template=") {
+				tmplName = strings.TrimPrefix(rest[i], "--template=")
+				rest = append(rest[:i], rest[i+1:]...)
+				break
+			}
+		}
+		title := strings.Join(rest, " ")
 		if title == "" {
-			die("usage: grove new <title>")
+			die("usage: grove new [--template T] <title>")
 		}
 		note, err := store.Create(title, nil)
 		if err != nil {
 			die("create: %v", err)
+		}
+		date := time.Now().Format("2006-01-02")
+		note.Body = templates.Get(tmplName, title, date)
+		if err := store.Save(note); err != nil {
+			die("save: %v", err)
 		}
 		launchEditor(cfg.Editor, note.Filename)
 
@@ -128,6 +157,87 @@ func main() {
 			os.Exit(1)
 		}
 
+	case "ask":
+		question := strings.Join(args[1:], " ")
+		if question == "" {
+			die("usage: grove ask <question>")
+		}
+		if cfg.GeminiKey == "" {
+			fmt.Fprintln(os.Stderr, "grove: no Gemini API key configured (check ~/.config/pairy/config.json or set GEMINI_API_KEY)")
+			os.Exit(1)
+		}
+		all, err := store.LoadAll()
+		if err != nil {
+			die("load notes: %v", err)
+		}
+		aiClient := ai.NewClient(cfg.GeminiKey, cfg.GeminiModel)
+		ctx := make([]ai.NoteContext, len(all))
+		for i, n := range all {
+			ctx[i] = ai.NoteContext{Title: n.Title, Tags: n.Tags, Body: n.Body}
+		}
+		answer, err := aiClient.AskVault(ctx, question)
+		if err != nil {
+			die("AI error: %v", err)
+		}
+		fmt.Println(answer)
+
+	case "stats":
+		all, err := store.LoadAll()
+		if err != nil {
+			die("load notes: %v", err)
+		}
+		if len(all) == 0 {
+			fmt.Println("no notes yet")
+			return
+		}
+		totalWords := 0
+		tagCount := map[string]int{}
+		oldest := all[0]
+		newest := all[0]
+		for _, n := range all {
+			totalWords += len(strings.Fields(n.Body))
+			for _, t := range n.Tags {
+				tagCount[t]++
+			}
+			if n.Created.Before(oldest.Created) {
+				oldest = n
+			}
+			if n.Created.After(newest.Created) {
+				newest = n
+			}
+		}
+
+		// Top 5 tags
+		type tagFreq struct {
+			tag   string
+			count int
+		}
+		var tagList []tagFreq
+		for t, c := range tagCount {
+			tagList = append(tagList, tagFreq{t, c})
+		}
+		sort.Slice(tagList, func(i, j int) bool {
+			return tagList[i].count > tagList[j].count
+		})
+		if len(tagList) > 5 {
+			tagList = tagList[:5]
+		}
+
+		fmt.Printf("notes:       %d\n", len(all))
+		fmt.Printf("words:       %d\n", totalWords)
+		fmt.Printf("oldest note: %s\n", oldest.Title)
+		fmt.Printf("newest note: %s\n", newest.Title)
+		if len(tagList) > 0 {
+			fmt.Print("top tags:    ")
+			for i, tf := range tagList {
+				if i > 0 {
+					fmt.Print(", ")
+				}
+				fmt.Printf("%s (%d)", tf.tag, tf.count)
+			}
+			fmt.Println()
+		}
+
 	default:
 		fmt.Fprintf(os.Stderr, "grove: unknown command %q\n\n", args[0])
 		fmt.Print(usage)
@@ -154,7 +264,7 @@ func ensureWelcome(store *notes.Store) {
 	if err != nil {
 		return
 	}
-	note.Body = `## Welcome to grove 🌿
+	note.Body = `## Welcome to grove
 
 Your knowledge garden in the terminal. Notes are plain markdown files — yours forever.
 
@@ -163,19 +273,25 @@ Your knowledge garden in the terminal. Notes are plain markdown files — yours 
 | Key | Action |
 |-----|--------|
 | **n** | new note |
+| **N** | new note with template |
 | **t** | today's daily note |
 | **/** | fuzzy search |
 | **e** | edit in $EDITOR |
 | **A** | ask AI about this note |
+| **@** | vault-wide AI |
+| **L** | links panel |
 | **?** | full help |
 
 ### From the command line
 
 ` + "```sh" + `
-grove today          # open today's daily note
-grove add "idea"     # append a quick thought to today's note
-grove new "title"    # create and open a note
-grove list           # list all notes
+grove today                      # open today's daily note
+grove add "idea"                 # append a quick thought to today's note
+grove new "title"                # create and open a note
+grove new --template meeting "Title"  # use a template
+grove list                       # list all notes
+grove ask "what did I write about auth?"  # AI search across vault
+grove stats                      # show vault statistics
 ` + "```" + `
 
 ### Tips

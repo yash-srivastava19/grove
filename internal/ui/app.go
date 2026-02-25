@@ -3,6 +3,7 @@ package ui
 import (
 	"fmt"
 	"os/exec"
+	"regexp"
 	"strings"
 	"time"
 
@@ -15,6 +16,7 @@ import (
 	"github.com/yash-srivastava19/grove/internal/ai"
 	"github.com/yash-srivastava19/grove/internal/config"
 	"github.com/yash-srivastava19/grove/internal/notes"
+	"github.com/yash-srivastava19/grove/internal/templates"
 )
 
 type appState int
@@ -24,12 +26,16 @@ const (
 	stateViewer
 	stateSearch
 	stateNewNote
+	stateTemplatePicker // N key: pick template
+	stateTemplateTitle  // after template picked: enter title
 	stateAIPanel
 	stateConfirmDelete
 	stateHelp
+	stateLinks    // L key: wiki-links panel
+	stateVaultAI  // @ key: vault-wide AI
 )
 
-// Messages
+// ── Messages ──────────────────────────────────────────────────────────────────
 
 type notesLoadedMsg struct {
 	notes []*notes.Note
@@ -37,15 +43,22 @@ type notesLoadedMsg struct {
 }
 
 type editorClosedMsg struct {
-	notes    []*notes.Note
-	openID   string
-	err      error
+	notes  []*notes.Note
+	openID string
+	err    error
 }
 
 type aiResponseMsg struct {
 	response string
 	err      error
 }
+
+type vaultAIResponseMsg struct {
+	response string
+	err      error
+}
+
+// ── App struct ────────────────────────────────────────────────────────────────
 
 // App is the main Bubble Tea model.
 type App struct {
@@ -68,17 +81,24 @@ type App struct {
 	viewport viewport.Model
 
 	// Inputs
-	searchInput  textinput.Model
-	newNoteInput textinput.Model
-	aiInput      textinput.Model
+	searchInput     textinput.Model
+	newNoteInput    textinput.Model
+	aiInput         textinput.Model
+	vaultAIInput    textinput.Model
+	templateTitleIn textinput.Model
 
 	// Search
 	searchQuery string
 
-	// AI
-	aiHistory []aiEntry // Q+A pairs
+	// AI (per-note)
+	aiHistory []aiEntry
 	aiLoading bool
 	aiError   string
+
+	// Vault AI
+	vaultAIHistory []aiEntry
+	vaultAILoading bool
+	vaultAIError   string
 
 	// Delete
 	deleteTarget *notes.Note
@@ -92,6 +112,18 @@ type App struct {
 	// Status
 	statusMsg     string
 	statusIsError bool
+
+	// Template picker
+	templateCursor   int
+	selectedTemplate string
+
+	// Links panel
+	linksCursor  int
+	linksOut     []string      // outgoing link targets
+	linksBack    []*notes.Note // backlinks
+
+	// Rendered lines for paragraph navigation
+	renderedLines []string
 }
 
 type aiEntry struct {
@@ -112,16 +144,26 @@ func New(cfg *config.Config, store *notes.Store, aiClient *ai.Client) *App {
 	aip.Placeholder = "ask about this note..."
 	aip.CharLimit = 500
 
+	vaip := textinput.New()
+	vaip.Placeholder = "ask about your entire vault..."
+	vaip.CharLimit = 500
+
+	tti := textinput.New()
+	tti.Placeholder = "note title..."
+	tti.CharLimit = 200
+
 	vp := viewport.New(80, 20)
 
 	return &App{
-		cfg:          cfg,
-		store:        store,
-		ai:           aiClient,
-		searchInput:  si,
-		newNoteInput: ni,
-		aiInput:      aip,
-		viewport:     vp,
+		cfg:             cfg,
+		store:           store,
+		ai:              aiClient,
+		searchInput:     si,
+		newNoteInput:    ni,
+		aiInput:         aip,
+		vaultAIInput:    vaip,
+		templateTitleIn: tti,
+		viewport:        vp,
 	}
 }
 
@@ -139,7 +181,6 @@ func (a *App) cmdLoadNotes() tea.Cmd {
 }
 
 func editorCmd(editor, path string) *exec.Cmd {
-	// Support editor config with args, e.g. "code --wait"
 	parts := strings.Fields(editor)
 	if len(parts) == 0 {
 		parts = []string{"vi"}
@@ -163,6 +204,18 @@ func (a *App) cmdAskAI(note *notes.Note, question string) tea.Cmd {
 	return func() tea.Msg {
 		resp, err := a.ai.Ask(note.Title, note.Body, question)
 		return aiResponseMsg{response: resp, err: err}
+	}
+}
+
+func (a *App) cmdAskVault(question string) tea.Cmd {
+	all := a.allNotes
+	return func() tea.Msg {
+		ctx := make([]ai.NoteContext, len(all))
+		for i, n := range all {
+			ctx[i] = ai.NoteContext{Title: n.Title, Tags: n.Tags, Body: n.Body}
+		}
+		resp, err := a.ai.AskVault(ctx, question)
+		return vaultAIResponseMsg{response: resp, err: err}
 	}
 }
 
@@ -192,7 +245,6 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 	case editorClosedMsg:
-		// Always reload notes even on editor error (file may have been saved)
 		if msg.err != nil {
 			a.setStatus("editor: "+msg.err.Error(), true)
 		}
@@ -221,8 +273,15 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			a.aiHistory[len(a.aiHistory)-1].answer = msg.response
 		}
 
+	case vaultAIResponseMsg:
+		a.vaultAILoading = false
+		if msg.err != nil {
+			a.vaultAIError = msg.err.Error()
+		} else if len(a.vaultAIHistory) > 0 {
+			a.vaultAIHistory[len(a.vaultAIHistory)-1].answer = msg.response
+		}
+
 	case tea.KeyMsg:
-		// Clear status on any key
 		a.statusMsg = ""
 
 		switch a.state {
@@ -234,12 +293,20 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return a.updateSearch(msg)
 		case stateNewNote:
 			return a.updateNewNote(msg)
+		case stateTemplatePicker:
+			return a.updateTemplatePicker(msg)
+		case stateTemplateTitle:
+			return a.updateTemplateTitle(msg)
 		case stateAIPanel:
 			return a.updateAIPanel(msg)
 		case stateConfirmDelete:
 			return a.updateConfirmDelete(msg)
 		case stateHelp:
 			return a.updateHelp(msg)
+		case stateLinks:
+			return a.updateLinks(msg)
+		case stateVaultAI:
+			return a.updateVaultAI(msg)
 		}
 	}
 
@@ -292,6 +359,11 @@ func (a *App) updateList(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		a.newNoteInput.Focus()
 		return a, textinput.Blink
 
+	case "N":
+		// New note with template picker
+		a.state = stateTemplatePicker
+		a.templateCursor = 0
+
 	case "t":
 		note, err := a.store.CreateDaily()
 		if err != nil {
@@ -318,6 +390,18 @@ func (a *App) updateList(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	case "r":
 		return a, a.cmdLoadNotes()
+
+	case "@":
+		if !a.ai.Available() {
+			a.setStatus("no Gemini API key — check ~/.config/pairy/config.json", true)
+			return a, nil
+		}
+		a.state = stateVaultAI
+		a.vaultAIInput.SetValue("")
+		a.vaultAIInput.Focus()
+		a.vaultAIError = ""
+		a.vaultAILoading = false
+		return a, textinput.Blink
 
 	case "?":
 		a.prevState = stateList
@@ -354,6 +438,11 @@ func (a *App) updateViewer(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		a.aiLoading = false
 		return a, textinput.Blink
 
+	case "L":
+		if a.current != nil {
+			a.openLinksPanel()
+		}
+
 	case "g":
 		if prev == "g" {
 			a.viewport.GotoTop()
@@ -380,6 +469,12 @@ func (a *App) updateViewer(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	case "ctrl+b", "pgup":
 		a.viewport.ScrollUp(a.viewport.Height)
+
+	case "}":
+		a.jumpParagraph(1)
+
+	case "{":
+		a.jumpParagraph(-1)
 
 	case "?":
 		a.prevState = stateViewer
@@ -477,7 +572,71 @@ func (a *App) updateNewNote(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return a, cmd
 }
 
-// ── AI Panel ──────────────────────────────────────────────────────────────────
+// ── Template Picker ───────────────────────────────────────────────────────────
+
+func (a *App) updateTemplatePicker(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "esc", "q":
+		a.state = stateList
+		return a, nil
+
+	case "j", "down":
+		if a.templateCursor < len(templates.Names)-1 {
+			a.templateCursor++
+		}
+
+	case "k", "up":
+		if a.templateCursor > 0 {
+			a.templateCursor--
+		}
+
+	case "enter", "l":
+		a.selectedTemplate = templates.Names[a.templateCursor]
+		a.state = stateTemplateTitle
+		a.templateTitleIn.SetValue("")
+		a.templateTitleIn.Focus()
+		return a, textinput.Blink
+	}
+
+	return a, nil
+}
+
+func (a *App) updateTemplateTitle(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "esc":
+		a.state = stateTemplatePicker
+		a.templateTitleIn.Blur()
+		return a, nil
+
+	case "enter":
+		title := strings.TrimSpace(a.templateTitleIn.Value())
+		a.templateTitleIn.Blur()
+		if title == "" {
+			a.state = stateList
+			return a, nil
+		}
+		note, err := a.store.Create(title, nil)
+		if err != nil {
+			a.setStatus("error: "+err.Error(), true)
+			a.state = stateList
+			return a, nil
+		}
+		date := time.Now().Format("2006-01-02")
+		note.Body = templates.Get(a.selectedTemplate, title, date)
+		if err := a.store.Save(note); err != nil {
+			a.setStatus("save error: "+err.Error(), true)
+			a.state = stateList
+			return a, nil
+		}
+		return a, a.cmdOpenEditor(note)
+	}
+
+	var cmd tea.Cmd
+	a.templateTitleIn, cmd = a.templateTitleIn.Update(msg)
+	return a, cmd
+}
+
+// ── AI Panel (per-note) ───────────────────────────────────────────────────────
 
 func (a *App) updateAIPanel(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
@@ -542,6 +701,96 @@ func (a *App) updateHelp(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return a, nil
 }
 
+// ── Links Panel ───────────────────────────────────────────────────────────────
+
+func (a *App) openLinksPanel() {
+	if a.current == nil {
+		return
+	}
+	a.linksOut = notes.ExtractLinks(a.current.Body)
+	a.linksBack = notes.Backlinks(a.current.Title, a.allNotes)
+	a.linksCursor = 0
+	a.state = stateLinks
+}
+
+func (a *App) updateLinks(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	totalEntries := len(a.linksOut) + len(a.linksBack)
+
+	switch msg.String() {
+	case "esc", "q", "h":
+		a.state = stateViewer
+		return a, nil
+
+	case "j", "down":
+		if a.linksCursor < totalEntries-1 {
+			a.linksCursor++
+		}
+
+	case "k", "up":
+		if a.linksCursor > 0 {
+			a.linksCursor--
+		}
+
+	case "enter", "l":
+		// Determine which note to open
+		var targetTitle string
+		if a.linksCursor < len(a.linksOut) {
+			targetTitle = a.linksOut[a.linksCursor]
+		} else {
+			idx := a.linksCursor - len(a.linksOut)
+			if idx < len(a.linksBack) {
+				// open by ID
+				a.openNote(a.linksBack[idx])
+				return a, nil
+			}
+		}
+		if targetTitle != "" {
+			// find note by title
+			for _, n := range a.allNotes {
+				if strings.EqualFold(n.Title, targetTitle) {
+					a.openNote(n)
+					return a, nil
+				}
+			}
+			a.setStatus("note not found: "+targetTitle, true)
+			a.state = stateViewer
+		}
+	}
+
+	return a, nil
+}
+
+// ── Vault AI ──────────────────────────────────────────────────────────────────
+
+func (a *App) updateVaultAI(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "esc":
+		if !a.vaultAILoading {
+			a.state = stateList
+			a.vaultAIInput.Blur()
+		}
+		return a, nil
+
+	case "enter":
+		q := strings.TrimSpace(a.vaultAIInput.Value())
+		if q == "" || a.vaultAILoading {
+			return a, nil
+		}
+		a.vaultAILoading = true
+		a.vaultAIError = ""
+		a.vaultAIHistory = append(a.vaultAIHistory, aiEntry{question: q})
+		a.vaultAIInput.SetValue("")
+		return a, a.cmdAskVault(q)
+	}
+
+	if !a.vaultAILoading {
+		var cmd tea.Cmd
+		a.vaultAIInput, cmd = a.vaultAIInput.Update(msg)
+		return a, cmd
+	}
+	return a, nil
+}
+
 // ── Views ─────────────────────────────────────────────────────────────────────
 
 func (a *App) View() string {
@@ -557,12 +806,20 @@ func (a *App) View() string {
 		return a.viewSearch()
 	case stateNewNote:
 		return a.viewNewNote()
+	case stateTemplatePicker:
+		return a.viewTemplatePicker()
+	case stateTemplateTitle:
+		return a.viewTemplateTitle()
 	case stateAIPanel:
 		return a.viewAIPanel()
 	case stateConfirmDelete:
 		return a.viewConfirmDelete()
 	case stateHelp:
 		return a.viewHelp()
+	case stateLinks:
+		return a.viewLinks()
+	case stateVaultAI:
+		return a.viewVaultAI()
 	}
 	return ""
 }
@@ -571,12 +828,12 @@ func (a *App) viewList() string {
 	var b strings.Builder
 	w := a.width
 
-	// Header
 	count := fmt.Sprintf("%d notes", len(a.allNotes))
 	b.WriteString(styleTitle.Render("grove") + styleDivider.Render("  —  ") + styleSubtitle.Render(count) + "\n")
 	b.WriteString(styleDivider.Render(strings.Repeat("─", w)) + "\n")
 
-	listH := a.height - 5
+	// Reserve 1 extra line for note preview
+	listH := a.height - 6
 	if listH < 1 {
 		listH = 1
 	}
@@ -614,9 +871,19 @@ func (a *App) viewList() string {
 		b.WriteString("\n")
 	}
 
+	// Note preview: first non-empty non-heading line of highlighted note
+	preview := ""
+	if len(a.filtered) > 0 && a.cursor < len(a.filtered) {
+		preview = notePreview(a.filtered[a.cursor].Body, w-4)
+	}
+	if preview != "" {
+		b.WriteString(styleDimItem.Render("  " + preview) + "\n")
+	} else {
+		b.WriteString("\n")
+	}
+
 	b.WriteString(styleDivider.Render(strings.Repeat("─", w)) + "\n")
 
-	// Status / hints
 	if a.statusMsg != "" {
 		sty := styleSuccess
 		if a.statusIsError {
@@ -624,7 +891,7 @@ func (a *App) viewList() string {
 		}
 		b.WriteString(sty.Render("  " + a.statusMsg))
 	} else {
-		b.WriteString(styleHint.Render("  j/k  Enter  n new  t daily  / search  d delete  r refresh  ? help  q quit"))
+		b.WriteString(styleHint.Render("  j/k · Enter · n/N new · t daily · / search · d del · @ AI · ? help · q"))
 	}
 
 	return b.String()
@@ -637,8 +904,8 @@ func (a *App) viewViewer() string {
 	var b strings.Builder
 	w := a.width
 
-	editHint := styleDimItem.Render("[e]edit  [A]AI  [q]back")
-	title := styleTitle.Render(truncate(a.current.Title, w-26))
+	editHint := styleDimItem.Render("[e]edit  [A]AI  [L]links  [q]back")
+	title := styleTitle.Render(truncate(a.current.Title, w-36))
 	b.WriteString("  " + title + "  " + editHint + "\n")
 	b.WriteString(styleDivider.Render(strings.Repeat("─", w)) + "\n")
 	b.WriteString(a.viewport.View() + "\n")
@@ -652,7 +919,7 @@ func (a *App) viewViewer() string {
 		b.WriteString(sty.Render("  " + a.statusMsg))
 	} else {
 		pct := int(a.viewport.ScrollPercent() * 100)
-		// Show note position in list
+		wc := wordCount(a.current.Body)
 		pos := ""
 		for i, n := range a.filtered {
 			if a.current != nil && n.ID == a.current.ID {
@@ -660,7 +927,7 @@ func (a *App) viewViewer() string {
 				break
 			}
 		}
-		b.WriteString(styleHint.Render(fmt.Sprintf("  j/k  gg/G  d/u  e edit  A AI  q back%s  %d%%", pos, pct)))
+		b.WriteString(styleHint.Render(fmt.Sprintf("  j/k  gg/G  {/}  d/u  e edit  A AI  L links  q back%s  %d words  %d%%", pos, wc, pct)))
 	}
 	return b.String()
 }
@@ -671,7 +938,7 @@ func (a *App) viewSearch() string {
 
 	b.WriteString(styleTitle.Render("grove") + styleDivider.Render("  /  ") + styleSubtitle.Render("search") + "\n")
 	b.WriteString(styleDivider.Render(strings.Repeat("─", w)) + "\n")
-	b.WriteString(styleInputActive.Width(w - 4).Render(a.searchInput.View()) + "\n")
+	b.WriteString(styleInputActive.Width(w-4).Render(a.searchInput.View()) + "\n")
 
 	listH := a.height - 7
 	if listH < 1 {
@@ -722,6 +989,33 @@ func (a *App) viewNewNote() string {
 	return b.String()
 }
 
+func (a *App) viewTemplatePicker() string {
+	var b strings.Builder
+	b.WriteString(styleTitle.Render("grove") + styleDivider.Render("  +  ") + styleSubtitle.Render("new note — choose template") + "\n")
+	b.WriteString(styleDivider.Render(strings.Repeat("─", a.width)) + "\n\n")
+	for i, name := range templates.Names {
+		if i == a.templateCursor {
+			b.WriteString("  " + styleSelectedItem.Render("▸ "+name) + "\n")
+		} else {
+			b.WriteString("    " + styleNormalItem.Render(name) + "\n")
+		}
+	}
+	b.WriteString("\n")
+	b.WriteString(styleDivider.Render(strings.Repeat("─", a.width)) + "\n")
+	b.WriteString(styleHint.Render("  j/k navigate  Enter select  Esc cancel"))
+	return b.String()
+}
+
+func (a *App) viewTemplateTitle() string {
+	var b strings.Builder
+	b.WriteString(styleTitle.Render("grove") + styleDivider.Render("  +  ") + styleSubtitle.Render("new note — "+a.selectedTemplate+" template") + "\n")
+	b.WriteString(styleDivider.Render(strings.Repeat("─", a.width)) + "\n\n")
+	b.WriteString(styleHint.Render("  Note title:") + "\n")
+	b.WriteString(styleInputActive.Width(a.width-4).Render(a.templateTitleIn.View()) + "\n\n")
+	b.WriteString(styleHint.Render("  Enter to create and open in $EDITOR  ·  Esc to go back"))
+	return b.String()
+}
+
 func (a *App) viewAIPanel() string {
 	if a.current == nil {
 		return a.viewViewer()
@@ -739,7 +1033,6 @@ func (a *App) viewAIPanel() string {
 		innerH = 3
 	}
 
-	// Build conversation display
 	var lines []string
 	r, _ := glamour.NewTermRenderer(glamour.WithAutoStyle(), glamour.WithWordWrap(w-10))
 
@@ -762,14 +1055,13 @@ func (a *App) viewAIPanel() string {
 			lines = append(lines, "")
 		}
 		if a.aiLoading {
-			lines = append(lines, styleSubtitle.Render("  ⟳  thinking..."))
+			lines = append(lines, styleSubtitle.Render("  thinking..."))
 		}
 		if a.aiError != "" {
-			lines = append(lines, styleError.Render("  ✗  "+a.aiError))
+			lines = append(lines, styleError.Render("  error: "+a.aiError))
 		}
 	}
 
-	// Trim to visible height (show last N lines)
 	if len(lines) > innerH {
 		lines = lines[len(lines)-innerH:]
 	}
@@ -809,33 +1101,47 @@ func (a *App) viewHelp() string {
 	help := lipgloss.JoinVertical(lipgloss.Left,
 		styleDivider.Render("  LIST"),
 		"    j/k          navigate",
-		"    gg / G        top / bottom",
-		"    Enter / l     open note",
-		"    n             new note",
-		"    t             today's daily note",
-		"    /             fuzzy search",
-		"    d             delete (with confirm)",
-		"    r             refresh",
-		"    q             quit",
+		"    gg / G       top / bottom",
+		"    Enter / l    open note",
+		"    n            new note",
+		"    N            new note with template",
+		"    t            today's daily note",
+		"    /            fuzzy search",
+		"    d            delete (with confirm)",
+		"    @            vault-wide AI",
+		"    r            refresh",
+		"    q            quit",
 		"",
 		styleDivider.Render("  VIEWER"),
-		"    j/k           scroll",
-		"    gg / G         top / bottom",
-		"    d/u           half-page down/up",
-		"    e             open in $EDITOR",
-		"    A             ask AI about note",
-		"    q / h / Esc   back to list",
+		"    j/k          scroll",
+		"    gg / G       top / bottom",
+		"    { / }        prev / next paragraph",
+		"    d/u          half-page down/up",
+		"    e            open in $EDITOR",
+		"    A            ask AI about note",
+		"    L            links panel (wiki-links)",
+		"    q / h / Esc  back to list",
 		"",
 		styleDivider.Render("  SEARCH"),
-		"    type          filter",
-		"    Enter         open",
-		"    ctrl+n/p      navigate results",
-		"    Esc           cancel",
+		"    type         filter",
+		"    Enter        open",
+		"    ctrl+n/p     navigate results",
+		"    Esc          cancel",
 		"",
 		styleDivider.Render("  AI PANEL"),
-		"    type          your question",
-		"    Enter         send to Gemini",
-		"    Esc           back",
+		"    type         your question",
+		"    Enter        send to Gemini",
+		"    Esc          back",
+		"",
+		styleDivider.Render("  LINKS PANEL"),
+		"    j/k          navigate",
+		"    Enter        open linked note",
+		"    Esc / q      back to viewer",
+		"",
+		styleDivider.Render("  VAULT AI  (@)"),
+		"    type         your question",
+		"    Enter        send to Gemini",
+		"    Esc          back to list",
 	)
 
 	var b strings.Builder
@@ -844,6 +1150,136 @@ func (a *App) viewHelp() string {
 	b.WriteString(help + "\n\n")
 	b.WriteString(styleDivider.Render(strings.Repeat("─", a.width)) + "\n")
 	b.WriteString(styleHint.Render("  q / Esc / ? to close"))
+	return b.String()
+}
+
+func (a *App) viewLinks() string {
+	if a.current == nil {
+		return a.viewViewer()
+	}
+	var b strings.Builder
+	w := a.width
+
+	b.WriteString(styleTitle.Render("grove") + styleDivider.Render("  —  ") + styleSubtitle.Render("links: "+a.current.Title) + "\n")
+	b.WriteString(styleDivider.Render(strings.Repeat("─", w)) + "\n\n")
+
+	idx := 0
+
+	// Outgoing links
+	b.WriteString(styleAILabel.Render("  → outgoing links") + "\n")
+	if len(a.linksOut) == 0 {
+		b.WriteString(styleDimItem.Render("    (none)") + "\n")
+	} else {
+		for _, target := range a.linksOut {
+			// Check if note exists
+			found := false
+			for _, n := range a.allNotes {
+				if strings.EqualFold(n.Title, target) {
+					found = true
+					break
+				}
+			}
+			label := "[[" + target + "]]"
+			if !found {
+				label = label + " (not found)"
+			}
+			if idx == a.linksCursor {
+				b.WriteString("  " + styleSelectedItem.Render("▸ "+label) + "\n")
+			} else if !found {
+				b.WriteString("    " + styleDimItem.Render(label) + "\n")
+			} else {
+				b.WriteString("    " + styleNormalItem.Render(label) + "\n")
+			}
+			idx++
+		}
+	}
+
+	b.WriteString("\n")
+
+	// Backlinks
+	b.WriteString(styleAILabel.Render("  ← backlinks") + "\n")
+	if len(a.linksBack) == 0 {
+		b.WriteString(styleDimItem.Render("    (none)") + "\n")
+	} else {
+		for _, n := range a.linksBack {
+			label := n.Title
+			if idx == a.linksCursor {
+				b.WriteString("  " + styleSelectedItem.Render("▸ "+label) + "\n")
+			} else {
+				b.WriteString("    " + styleNormalItem.Render(label) + "\n")
+			}
+			idx++
+		}
+	}
+
+	b.WriteString("\n")
+	b.WriteString(styleDivider.Render(strings.Repeat("─", w)) + "\n")
+	b.WriteString(styleHint.Render("  j/k navigate  Enter open  Esc back to viewer"))
+	return b.String()
+}
+
+func (a *App) viewVaultAI() string {
+	var b strings.Builder
+	w := a.width
+
+	vaultLabel := styleAILabel.Render("[ vault AI ]")
+	b.WriteString(styleTitle.Render("grove") + styleDivider.Render("  —  ") + vaultLabel + "\n")
+	b.WriteString(styleDivider.Render(strings.Repeat("─", w)) + "\n")
+
+	innerH := a.height - 10
+	if innerH < 3 {
+		innerH = 3
+	}
+
+	var lines []string
+	r, _ := glamour.NewTermRenderer(glamour.WithAutoStyle(), glamour.WithWordWrap(w-10))
+
+	if len(a.vaultAIHistory) == 0 && !a.vaultAILoading {
+		lines = []string{styleSubtitle.Render("  Ask anything about your vault...")}
+	} else {
+		for _, entry := range a.vaultAIHistory {
+			lines = append(lines, styleAILabel.Render("  Q: ")+styleNormalItem.Render(entry.question))
+			if entry.answer != "" {
+				rendered := entry.answer
+				if r != nil {
+					if out, err := r.Render(entry.answer); err == nil {
+						rendered = strings.TrimRight(out, "\n")
+					}
+				}
+				for _, l := range strings.Split(rendered, "\n") {
+					lines = append(lines, l)
+				}
+			}
+			lines = append(lines, "")
+		}
+		if a.vaultAILoading {
+			lines = append(lines, styleSubtitle.Render("  thinking..."))
+		}
+		if a.vaultAIError != "" {
+			lines = append(lines, styleError.Render("  error: "+a.vaultAIError))
+		}
+	}
+
+	if len(lines) > innerH {
+		lines = lines[len(lines)-innerH:]
+	}
+	content := strings.Join(lines, "\n")
+
+	panel := stylePanelBorder.Width(w - 6).Height(innerH).Render(content)
+	b.WriteString(panel + "\n\n")
+
+	inputSty := styleInputActive
+	if a.vaultAILoading {
+		inputSty = styleInputBorder
+	}
+	b.WriteString(inputSty.Width(w-4).Render(a.vaultAIInput.View()) + "\n")
+	b.WriteString(styleDivider.Render(strings.Repeat("─", w)) + "\n")
+
+	if a.vaultAILoading {
+		b.WriteString(styleHint.Render(fmt.Sprintf("  waiting for Gemini...  (%d notes in context)", len(a.allNotes))))
+	} else {
+		b.WriteString(styleHint.Render(fmt.Sprintf("  Enter submit  Esc back  (%d notes)", len(a.allNotes))))
+	}
 	return b.String()
 }
 
@@ -856,7 +1292,7 @@ func (a *App) openNote(note *notes.Note) {
 		return
 	}
 	a.current = loaded
-	a.aiHistory = nil // reset AI history per note
+	a.aiHistory = nil
 	a.state = stateViewer
 	a.reRender()
 }
@@ -866,31 +1302,34 @@ func (a *App) reRender() {
 		return
 	}
 
-	content := a.current.Body
-	if len(a.current.Tags) > 0 {
-		tagLine := styleTag.Render("tags: #" + strings.Join(a.current.Tags, " #"))
-		content = tagLine + "\n\n" + content
-	}
+	// Preprocess wiki-links: replace [[target]] with `[[target]]` so glamour
+	// renders them as inline code — visually distinct without breaking layout.
+	body := preprocessLinks(a.current.Body)
 
 	r, err := glamour.NewTermRenderer(
 		glamour.WithAutoStyle(),
 		glamour.WithWordWrap(a.viewport.Width-2),
 	)
-	if err != nil {
-		a.viewport.SetContent(content)
-		return
+	rendered := body
+	if err == nil {
+		if out, err2 := r.Render(body); err2 == nil {
+			rendered = out
+		}
 	}
-	rendered, err := r.Render(content)
-	if err != nil {
-		a.viewport.SetContent(content)
-		return
+
+	// Prepend tag line after glamour render so ANSI codes stay clean.
+	if len(a.current.Tags) > 0 {
+		tagLine := styleTag.Render("tags: #" + strings.Join(a.current.Tags, " #"))
+		rendered = tagLine + "\n\n" + rendered
 	}
+
+	a.renderedLines = strings.Split(rendered, "\n")
 	a.viewport.SetContent(rendered)
 	a.viewport.GotoTop()
 }
 
 func (a *App) ensureVisible() {
-	listH := a.height - 5
+	listH := a.height - 6
 	if listH < 1 {
 		listH = 1
 	}
@@ -900,6 +1339,36 @@ func (a *App) ensureVisible() {
 	if a.cursor >= a.listOffset+listH {
 		a.listOffset = a.cursor - listH + 1
 	}
+}
+
+func (a *App) jumpParagraph(direction int) {
+	lines := a.renderedLines
+	if len(lines) == 0 {
+		return
+	}
+	cur := a.viewport.YOffset
+	i := cur
+
+	if direction > 0 {
+		for i < len(lines) && strings.TrimSpace(lines[i]) == "" {
+			i++
+		}
+		for i < len(lines) && strings.TrimSpace(lines[i]) != "" {
+			i++
+		}
+		for i < len(lines) && strings.TrimSpace(lines[i]) == "" {
+			i++
+		}
+	} else {
+		i--
+		for i > 0 && strings.TrimSpace(lines[i]) == "" {
+			i--
+		}
+		for i > 0 && strings.TrimSpace(lines[i-1]) != "" {
+			i--
+		}
+	}
+	a.viewport.SetYOffset(i)
 }
 
 func (a *App) setStatus(msg string, isErr bool) {
@@ -934,5 +1403,30 @@ func truncate(s string, maxLen int) string {
 		return s
 	}
 	return string(runes[:maxLen-1]) + "…"
+}
+
+// notePreview returns the first non-empty, non-heading line of a note body,
+// truncated to maxW characters.
+func notePreview(body string, maxW int) string {
+	for _, line := range strings.Split(body, "\n") {
+		l := strings.TrimSpace(line)
+		if l == "" || strings.HasPrefix(l, "#") {
+			continue
+		}
+		return truncate(l, maxW)
+	}
+	return ""
+}
+
+// wordCount counts words in a string.
+func wordCount(s string) int {
+	return len(strings.Fields(s))
+}
+
+// preprocessLinks replaces [[target]] with `[[target]]` for glamour rendering.
+var wikiLinkRe = regexp.MustCompile(`\[\[([^\]]+)\]\]`)
+
+func preprocessLinks(body string) string {
+	return wikiLinkRe.ReplaceAllString(body, "`[[$1]]`")
 }
 
