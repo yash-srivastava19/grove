@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/yash-srivastava19/grove/actions/workflows/ci.yml/badge.svg)](https://github.com/yash-srivastava19/grove/actions/workflows/ci.yml)
 
-Your knowledge garden in the terminal. Obsidian-style note-taking, fully in the CLI.
+Your knowledge garden in the terminal.
 
 ```
 grove — 3 notes
@@ -11,88 +11,71 @@ grove — 3 notes
   Ideas Backlog                                    1d
   Meeting Notes                                    1w
 ──────────────────────────────────────────────────────
-j/k  Enter  n new  t daily  / search  d delete  ? help  q quit
+j/k  Enter  n new  t daily  / search  ? help  q quit
 ```
-
-## Features
-
-- **Vim keybindings** throughout — `j/k`, `gg`/`G`, `/` search, `d` delete
-- **Markdown rendering** in the viewer (via Glamour)
-- **Fuzzy search** across titles, tags, and body
-- **Daily notes** — `t` or `grove today` to open today's note
-- **AI assistant** — `A` in any note to ask Gemini about it (reuses pairy config)
-- **$EDITOR integration** — `e` opens the note in your editor (nvim, vim, etc.)
-- **YAML frontmatter** — title, tags, created/updated timestamps
 
 ## Install
 
 ```sh
-git clone https://github.com/yash-srivastava19/grove
-cd grove
-go build -o grove .
-sudo mv grove /usr/local/bin/
+curl -fsSL https://raw.githubusercontent.com/yash-srivastava19/grove/main/install.sh | bash
 ```
 
-## Usage
+Or manually:
 
 ```sh
-grove                   # open TUI
-grove new "my note"     # create and open note in $EDITOR
-grove today             # open today's daily note
-grove list              # list notes (non-interactive)
-grove version
+git clone https://github.com/yash-srivastava19/grove
+cd grove && go build -o grove . && sudo mv grove /usr/local/bin/
 ```
 
-## Keybindings
+## Use it
 
-### List view
+```sh
+grove              # open your vault (TUI)
+grove today        # open today's daily note in $EDITOR
+grove add "idea"   # append a quick thought to today's note (no TUI needed)
+grove new "title"  # create a note and open it
+grove list         # list all notes
+```
+
+## Keys (inside TUI)
+
 | Key | Action |
 |-----|--------|
 | `j` / `k` | navigate |
-| `gg` / `G` | top / bottom |
-| `Enter` / `l` | open note |
+| `Enter` | open note |
 | `n` | new note |
 | `t` | today's daily note |
-| `/` | fuzzy search |
-| `d` | delete (with confirm) |
-| `r` | refresh |
-| `q` | quit |
-
-### Note viewer
-| Key | Action |
-|-----|--------|
-| `j` / `k` | scroll |
-| `gg` / `G` | top / bottom |
-| `d` / `u` | half-page down / up |
-| `e` | open in `$EDITOR` |
+| `/` | fuzzy search (title + tags + body) |
+| `e` | edit in `$EDITOR` (nvim, vim…) |
 | `A` | ask AI about this note |
-| `q` / `h` / `Esc` | back |
+| `d` | delete |
+| `gg` / `G` | top / bottom |
+| `?` | help |
+| `q` | quit / back |
 
-### Search
-| Key | Action |
-|-----|--------|
-| type | filter |
-| `Enter` | open top result |
-| `ctrl+n` / `ctrl+p` | navigate results |
-| `Esc` | cancel |
+## Suggested workflows
 
-## AI (Gemini)
+**Daily driver** — open grove each morning, hit `t` to start your daily note. Use `grove add "quick thought"` from anywhere in your shell to capture without opening the TUI.
 
-grove reuses your [pairy](https://github.com/yash-srivastava19/pairy) config at `~/.config/pairy/config.json`.
-No extra setup needed if you already use pairy.
+**Project notes** — `grove new "project-x kickoff"`, add tags `[work, project-x]`. Search with `/project-x` to find everything.
+
+**AI-powered review** — open any note, hit `A`, ask Gemini to summarize, critique, or ask probing questions. Good for thinking out loud.
+
+## AI setup
+
+If you use [pairy](https://github.com/yash-srivastava19/pairy), you're already set — grove reads `~/.config/pairy/config.json`.
 
 Otherwise, set `GEMINI_API_KEY` or create `~/.config/grove/config.json`:
 
 ```json
-{
-  "api_key": "YOUR_GEMINI_API_KEY",
-  "model": "gemini-2.5-flash"
-}
+{ "api_key": "YOUR_GEMINI_API_KEY" }
 ```
 
-## Note format
+Get a free key at [aistudio.google.com](https://aistudio.google.com).
 
-Notes are plain markdown files with YAML frontmatter:
+## Notes format
+
+Plain markdown with frontmatter — your files, forever:
 
 ```markdown
 ---
@@ -102,21 +85,7 @@ created: 2026-02-25T10:00:00Z
 updated: 2026-02-25T10:30:00Z
 ---
 
-Your note content here.
+Your content here.
 ```
 
-Notes live in `~/.local/share/grove/notes/` by default.
-
-## Configuration
-
-`~/.config/grove/config.json`:
-
-```json
-{
-  "notes_dir": "~/.local/share/grove/notes",
-  "editor": "nvim",
-  "ai_enabled": true,
-  "api_key": "YOUR_GEMINI_API_KEY",
-  "model": "gemini-2.5-flash"
-}
-```
+Default location: `~/.local/share/grove/notes/`
